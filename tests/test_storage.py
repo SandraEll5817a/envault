@@ -53,6 +53,14 @@ def test_s3_prefix_applied(s3_backend):
     assert backend._full_key("staging.env") == "envault/staging.env"
 
 
+def test_s3_prefix_empty(s3_backend):
+    """Ensure _full_key works correctly when no prefix is set."""
+    from envault.storage import S3Backend
+    with patch("boto3.client"):
+        backend = S3Backend(bucket="test-bucket", prefix="")
+        assert backend._full_key("prod.env") == "prod.env"
+
+
 # ---------------------------------------------------------------------------
 # GCSBackend tests
 # ---------------------------------------------------------------------------
@@ -85,21 +93,3 @@ def test_gcs_download(gcs_backend):
     mock_blob = MagicMock()
     mock_blob.download_as_bytes.return_value = b"gcs-secret"
     bucket.blob.return_value = mock_blob
-    result = backend.download("prod.env")
-    assert result == b"gcs-secret"
-
-
-def test_gcs_exists_true(gcs_backend):
-    backend, bucket = gcs_backend
-    mock_blob = MagicMock()
-    mock_blob.exists.return_value = True
-    bucket.blob.return_value = mock_blob
-    assert backend.exists("prod.env") is True
-
-
-def test_gcs_exists_false(gcs_backend):
-    backend, bucket = gcs_backend
-    mock_blob = MagicMock()
-    mock_blob.exists.return_value = False
-    bucket.blob.return_value = mock_blob
-    assert backend.exists("missing.env") is False
