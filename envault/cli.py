@@ -1,74 +1,84 @@
-"""Command-line interface for envault."""
+"""Main CLI entry point for envault."""
 
-import sys
+import os
 import click
-from pathlib import Path
-
-from envault.crypto import encrypt, decrypt
 from envault.storage import S3Backend, GCSBackend
+from envault.crypto import encrypt, decrypt
+from envault.audit import record_event
+from envault.cli_audit import audit_log
+from envault.cli_keys import keys_group
 
 
-def get_backend(backend: str, bucket: str):
-    """Instantiate the appropriate storage backend."""
+def get_backend():
+    backend = os.environ.get("ENVAULT_BACKEND", "s3").lower()
+    bucket = os.environ.get("ENVAULT_BUCKET", "")
+    prefix = os.environ.get("ENVAULT_PREFIX", "envault")
     if backend == "s3":
-        return S3Backend(bucket)
+        return S3Backend(bucket=bucket, prefix=prefix)
     elif backend == "gcs":
-        return GCSBackend(bucket)
+        return GCSBackend(bucket=bucket, prefix=prefix)
     else:
-        raise click.BadParameter(f"Unknown backend '{backend}'. Choose 's3' or 'gcs'.")
+        raise click.ClickException(f"Unknown backend: {backend}")
 
 
 @click.group()
 def cli():
     """envault — securely sync .env files via encrypted cloud storage."""
+    pass
 
 
-@cli.command("push")
-@click.argument("env_file", default=".env", type=click.Path(exists=True))
-@click.option("--key", required=True, envvar="ENVAULT_KEY", help="Encryption passphrase.")
-@click.option("--bucket", required=True, envvar="ENVAULT_BUCKET", help="Storage bucket name.")
-@click.option("--backend", default="s3", show_default=True, envvar="ENVAULT_BACKEND", help="Storage backend (s3 or gcs).")
-@click.option("--remote-path", default="envault/.env.enc", show_default=True, help="Remote object path.")
-def push(env_file, key, bucket, backend, remote_path):
-    """Encrypt and upload a .env file to cloud storage."""
-    data = Path(env_file).read_bytes()
-    ciphertext = encrypt(data, key)
-    storage = get_backend(backend, bucket)
-    storage.upload(remote_path, ciphertext)
-    click.echo(f"✓ Pushed '{env_file}' → {backend}://{bucket}/{remote_path}")
+@cli.command()
+@click.argument("env_file", default=".env")
+@click.option("--passphrase", envvar="ENVAULT_PASSPHRASE", prompt=True, hide_input=True)
+@click.option("--key", "remote_key", default="default", help="Remote object key name.")
+def push(env_file, passphrase, remote_key):
+    """Encrypt and upload a .env file."""
+    try:
+        with open(env_file, "rb") as f:
+            plaintext = f.read()
+        ciphertext = encrypt(plaintext, passphrase)
+        backend = get_backend()
+        backend.upload(remote_key, ciphertext)
+        record_event(action="push", key=remote_key, success=True)
+        click.echo(f"Pushed '{env_file}' as '{remote_key}'.")
+    except Exception as e:
+        record_event(action="push", key=remote_key, success=False, error=str(e))
+        raise click.ClickException(str(e))
 
 
-@cli.command("pull")
-@click.argument("env_file", default=".env", type=click.Path())
-@click.option("--key", required=True, envvar="ENVAULT_KEY", help="Encryption passphrase.")
-@click.option("--bucket", required=True, envvar="ENVAULT_BUCKET", help="Storage bucket name.")
-@click.option("--backend", default="s3", show_default=True, envvar="ENVAULT_BACKEND", help="Storage backend (s3 or gcs).")
-@click.option("--remote-path", default="envault/.env.enc", show_default=True, help="Remote object path.")
-def pull(env_file, key, bucket, backend, remote_path):
-    """Download and decrypt a .env file from cloud storage."""
-    storage = get_backend(backend, bucket)
-    if not storage.exists(remote_path):
-        click.echo(f"✗ Remote file not found: {backend}://{bucket}/{remote_path}", err=True)
-        sys.exit(1)
-    ciphertext = storage.download(remote_path)
-    plaintext = decrypt(ciphertext, key)
-    Path(env_file).write_bytes(plaintext)
-    click.echo(f"✓ Pulled {backend}://{bucket}/{remote_path} → '{env_file}'")
+@cli.command()
+@click.argument("env_file", default=".env")
+@click.option("--passphrase", envvar="ENVAULT_PASSPHRASE", prompt=True, hide_input=True)
+@click.option("--key", "remote_key", default="default", help="Remote object key name.")
+def pull(env_file, passphrase, remote_key):
+    """Download and decrypt a .env file."""
+    try:
+        backend = get_backend()
+        if not backend.exists(remote_key):
+            raise click.ClickException(f"Remote key '{remote_key}' not found.")
+        ciphertext = backend.download(remote_key)
+        plaintext = decrypt(ciphertext, passphrase)
+        with open(env_file, "wb") as f:
+            f.write(plaintext)
+        record_event(action="pull", key=remote_key, success=True)
+        click.echo(f"Pulled '{remote_key}' to '{env_file}'.")
+    except click.ClickException:
+        raise
+    except Exception as e:
+        record_event(action="pull", key=remote_key, success=False, error=str(e))
+        raise click.ClickException(str(e))
 
 
-@cli.command("check")
-@click.option("--bucket", required=True, envvar="ENVAULT_BUCKET", help="Storage bucket name.")
-@click.option("--backend", default="s3", show_default=True, envvar="ENVAULT_BACKEND", help="Storage backend (s3 or gcs).")
-@click.option("--remote-path", default="envault/.env.enc", show_default=True, help="Remote object path.")
-def check(bucket, backend, remote_path):
+@cli.command()
+@click.option("--key", "remote_key", default="default")
+def check(remote_key):
     """Check whether a remote .env file exists."""
-    storage = get_backend(backend, bucket)
-    if storage.exists(remote_path):
-        click.echo(f"✓ Found: {backend}://{bucket}/{remote_path}")
+    backend = get_backend()
+    if backend.exists(remote_key):
+        click.echo(f"'{remote_key}' exists in remote storage.")
     else:
-        click.echo(f"✗ Not found: {backend}://{bucket}/{remote_path}")
-        sys.exit(1)
+        click.echo(f"'{remote_key}' does not exist in remote storage.")
 
 
-if __name__ == "__main__":
-    cli()
+cli.add_command(audit_log)
+cli.add_command(keys_group)
