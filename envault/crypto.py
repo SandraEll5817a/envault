@@ -55,3 +55,24 @@ def decrypt(ciphertext: bytes, passphrase: str) -> bytes:
         return fernet.decrypt(payload)
     except InvalidToken as exc:
         raise ValueError("Decryption failed: invalid passphrase or corrupted data.") from exc
+
+
+def reencrypt(ciphertext: bytes, old_passphrase: str, new_passphrase: str) -> bytes:
+    """Re-encrypt ciphertext under a new passphrase.
+
+    Decrypts the ciphertext using ``old_passphrase`` and immediately
+    re-encrypts the recovered plaintext with ``new_passphrase``.
+
+    Args:
+        ciphertext: Encrypted bytes in the format produced by :func:`encrypt`.
+        old_passphrase: The passphrase currently protecting the ciphertext.
+        new_passphrase: The new passphrase to protect the data with.
+
+    Returns:
+        New encrypted bytes (new salt + new encrypted payload).
+
+    Raises:
+        ValueError: If decryption with the old passphrase fails.
+    """
+    plaintext = decrypt(ciphertext, old_passphrase)
+    return encrypt(plaintext, new_passphrase)
