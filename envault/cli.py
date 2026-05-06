@@ -1,96 +1,91 @@
-"""Main CLI entry-point for envault."""
+"""Main CLI entry point for envault."""
 
-from __future__ import annotations
-
+import os
 import click
-
-from envault.storage import S3Backend, GCSBackend, StorageBackend
+from envault.storage import S3Backend, GCSBackend
 from envault.crypto import encrypt, decrypt
 from envault.audit import record_event
+from envault.cli_audit import audit_log
+from envault.cli_keys import keys_group
+from envault.cli_rotate import rotate_group
+from envault.cli_share import share_group
+from envault.cli_snapshot import snapshot_group
+from envault.cli_lock import lock_group
 
 
-def get_backend(backend_type: str, bucket: str) -> StorageBackend:
-    """Instantiate the requested storage backend."""
-    if backend_type == "s3":
+def get_backend():
+    backend = os.environ.get("ENVAULT_BACKEND", "s3").lower()
+    bucket = os.environ.get("ENVAULT_BUCKET", "")
+    if backend == "s3":
         return S3Backend(bucket)
-    if backend_type == "gcs":
+    elif backend == "gcs":
         return GCSBackend(bucket)
-    raise click.BadParameter(f"Unknown backend: {backend_type}")
+    else:
+        raise click.ClickException(f"Unknown backend: {backend}")
 
 
 @click.group()
-def cli() -> None:
+def cli():
     """envault — securely sync .env files via encrypted cloud storage."""
 
 
 @cli.command()
-@click.argument("key")
-@click.argument("env_file", type=click.Path(exists=True))
-@click.option("--passphrase", envvar="ENVAULT_PASSPHRASE", prompt=True, hide_input=True)
-@click.option("--backend", "backend_type", default="s3", show_default=True)
-@click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
-def push(
-    key: str,
-    env_file: str,
-    passphrase: str,
-    backend_type: str,
-    bucket: str,
-) -> None:
+@click.argument("env_name")
+@click.option("--passphrase", envvar="ENVAULT_PASSPHRASE", required=True, hide_input=True)
+@click.option("--file", "env_file", default=".env", show_default=True)
+def push(env_name: str, passphrase: str, env_file: str):
     """Encrypt and upload a .env file."""
-    backend = get_backend(backend_type, bucket)
-    with open(env_file, "rb") as fh:
-        plaintext = fh.read()
+    try:
+        plaintext = open(env_file, "rb").read()
+    except FileNotFoundError:
+        record_event("push", env_name, success=False)
+        raise click.ClickException(f"File not found: {env_file}")
+
     ciphertext = encrypt(plaintext, passphrase)
-    backend.upload(key, ciphertext)
-    record_event(action="push", key=key, success=True)
-    click.echo(f"Pushed {env_file} → {key}")
+    backend = get_backend()
+    backend.upload(env_name, ciphertext)
+    record_event("push", env_name, success=True)
+    click.echo(f"Pushed '{env_file}' to '{env_name}'.")
 
 
 @cli.command()
-@click.argument("key")
-@click.argument("dest", type=click.Path())
-@click.option("--passphrase", envvar="ENVAULT_PASSPHRASE", prompt=True, hide_input=True)
-@click.option("--backend", "backend_type", default="s3", show_default=True)
-@click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
-def pull(
-    key: str,
-    dest: str,
-    passphrase: str,
-    backend_type: str,
-    bucket: str,
-) -> None:
+@click.argument("env_name")
+@click.option("--passphrase", envvar="ENVAULT_PASSPHRASE", required=True, hide_input=True)
+@click.option("--file", "env_file", default=".env", show_default=True)
+def pull(env_name: str, passphrase: str, env_file: str):
     """Download and decrypt a .env file."""
-    backend = get_backend(backend_type, bucket)
-    ciphertext = backend.download(key)
-    if ciphertext is None:
-        record_event(action="pull", key=key, success=False, detail="not found")
-        click.echo(f"Error: {key} not found in bucket.", err=True)
-        raise SystemExit(1)
-    plaintext = decrypt(ciphertext, passphrase)
-    with open(dest, "wb") as fh:
+    backend = get_backend()
+    if not backend.exists(env_name):
+        record_event("pull", env_name, success=False)
+        raise click.ClickException(f"Remote env '{env_name}' not found.")
+
+    ciphertext = backend.download(env_name)
+    try:
+        plaintext = decrypt(ciphertext, passphrase)
+    except Exception:
+        record_event("pull", env_name, success=False)
+        raise click.ClickException("Decryption failed. Wrong passphrase?")
+
+    with open(env_file, "wb") as fh:
         fh.write(plaintext)
-    record_event(action="pull", key=key, success=True)
-    click.echo(f"Pulled {key} → {dest}")
+    record_event("pull", env_name, success=True)
+    click.echo(f"Pulled '{env_name}' to '{env_file}'.")
 
 
 @cli.command()
-@click.argument("key")
-@click.option("--backend", "backend_type", default="s3", show_default=True)
-@click.option("--bucket", envvar="ENVAULT_BUCKET", required=True)
-def check(key: str, backend_type: str, bucket: str) -> None:
-    """Check whether a key exists in the bucket."""
-    backend = get_backend(backend_type, bucket)
-    if backend.exists(key):
-        click.echo(f"{key} exists.")
+@click.argument("env_name")
+def check(env_name: str):
+    """Check whether a remote env exists."""
+    backend = get_backend()
+    if backend.exists(env_name):
+        click.echo(f"'{env_name}' exists in remote storage.")
     else:
-        click.echo(f"{key} does not exist.")
+        click.echo(f"'{env_name}' does NOT exist in remote storage.")
 
-
-# Register sub-command groups from other modules
-from envault.cli_audit import audit_log  # noqa: E402
-from envault.cli_keys import keys_group  # noqa: E402
-from envault.cli_rotate import rotate_group  # noqa: E402
 
 cli.add_command(audit_log)
 cli.add_command(keys_group, name="keys")
 cli.add_command(rotate_group, name="rotate")
+cli.add_command(share_group, name="share")
+cli.add_command(snapshot_group, name="snapshot")
+cli.add_command(lock_group, name="lock")
